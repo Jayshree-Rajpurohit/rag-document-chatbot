@@ -1,16 +1,18 @@
 import os
+import tempfile
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-import tempfile
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.output_parsers import StrOutputParser
 
 # ── Page config ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="RAG Chatbot",
+    page_title="RAG Document Chatbot",
     page_icon="🤖",
     layout="wide"
 )
@@ -43,17 +45,6 @@ st.markdown("""
         margin-right: 20%;
         color: #1A1A1A;
     }
-    .source-box {
-        background: #F8F9FA;
-        border-left: 3px solid #1D6E6E;
-        padding: 0.5rem 0.75rem;
-        border-radius: 0 8px 8px 0;
-        font-size: 0.8rem;
-        color: #444;
-        margin-top: 0.4rem;
-    }
-    .status-ready   { color: #1D6E6E; font-weight: 500; }
-    .status-pending { color: #C05A1F; font-weight: 500; }
     .stButton > button {
         background: linear-gradient(135deg, #1D6E6E, #534AB7);
         color: white;
@@ -62,11 +53,10 @@ st.markdown("""
         padding: 0.5rem 1.5rem;
         font-weight: 500;
     }
-    .stButton > button:hover { opacity: 0.9; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ───────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────
 st.markdown("""
 <div class="main-header">
     <h1>🤖 RAG Document Chatbot</h1>
@@ -74,36 +64,29 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Session state ────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────
 if "chat_history"  not in st.session_state: st.session_state.chat_history  = []
-if "chain"         not in st.session_state: st.session_state.chain          = None
-if "doc_processed" not in st.session_state: st.session_state.doc_processed  = False
-if "doc_name"      not in st.session_state: st.session_state.doc_name       = ""
+if "vectorstore"   not in st.session_state: st.session_state.vectorstore   = None
+if "doc_processed" not in st.session_state: st.session_state.doc_processed = False
+if "doc_name"      not in st.session_state: st.session_state.doc_name      = ""
 
-# ── Sidebar ──────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Setup")
-
+    st.markdown("💡 **Powered by GitHub Models + LangChain RAG**")
     api_key = st.text_input(
-        "OpenAI API Key",
+        "GitHub Token",
         type="password",
-        placeholder="sk-...",
-        help="Get your key from platform.openai.com"
+        placeholder="ghp_...",
+        help="Get your free key from aistudio.google.com/app/apikey"
     )
 
     st.divider()
     st.header("📄 Upload Document")
-
-    uploaded_file = st.file_uploader(
-        "Upload a PDF file",
-        type=["pdf"],
-        help="Upload any PDF — research paper, company policy, notes, etc."
-    )
-
-    chunk_size    = st.slider("Chunk size",    300, 1500, 800,  50,  help="Size of each text chunk")
-    chunk_overlap = st.slider("Chunk overlap", 0,   300,  100,  25,  help="Overlap between chunks for context continuity")
-
-    process_btn = st.button("🚀 Process Document", use_container_width=True)
+    uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
+    chunk_size    = st.slider("Chunk size",    300, 1500, 800, 50)
+    chunk_overlap = st.slider("Chunk overlap", 0,   300,  100, 25)
+    process_btn   = st.button("🚀 Process Document", use_container_width=True)
 
     if st.session_state.doc_processed:
         st.success(f"✅ Ready: **{st.session_state.doc_name}**")
@@ -111,9 +94,9 @@ with st.sidebar:
         st.info("⬆️ Upload a PDF to get started")
 
     st.divider()
-    if st.button("🗑️ Clear Chat History", use_container_width=True):
+    if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.chat_history  = []
-        st.session_state.chain         = None
+        st.session_state.vectorstore   = None
         st.session_state.doc_processed = False
         st.session_state.doc_name      = ""
         st.rerun()
@@ -122,82 +105,105 @@ with st.sidebar:
     st.markdown("""
     **How it works:**
     1. Upload any PDF document
-    2. Document is split into chunks
-    3. Chunks stored in ChromaDB (vector DB)
-    4. Your question → finds relevant chunks → LLM answers
+    2. Document split into chunks
+    3. Chunks stored in ChromaDB
+    4. Question → finds relevant chunks → Gemini answers
 
     **Built with:**
-    `Python` · `LangChain` · `ChromaDB` · `OpenAI` · `Streamlit`
+    `Python` · `LangChain` · `ChromaDB` · `Gemini` · `Streamlit`
+
+    🔗 Get free key:
+    aistudio.google.com/app/apikey
     """)
 
-# ── Process document ─────────────────────────────────────────
+# ── Process document ──────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
-def process_document(file_bytes, filename, _api_key, chunk_size, chunk_overlap):
-    """Load PDF → split → embed → store in ChromaDB → return chain."""
-
-    # Save to temp file
+def process_document(file_bytes, filename, chunk_size, chunk_overlap):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
-    # Load PDF
-    loader   = PyPDFLoader(tmp_path)
+    loader    = PyPDFLoader(tmp_path)
     documents = loader.load()
 
-    # Split into chunks
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", " ", ""]
+        chunk_overlap=chunk_overlap
     )
     chunks = splitter.split_documents(documents)
 
-    # Embed + store in ChromaDB
-    embeddings   = OpenAIEmbeddings(openai_api_key=_api_key)
-    vectorstore  = Chroma.from_documents(chunks, embeddings)
+    # Free local embeddings — no API key needed!
+    with st.spinner("📥 Loading embedding model (first time only ~1 min)..."):
+        embeddings = HuggingFaceEmbeddings(
+            model_name="all-MiniLM-L6-v2",
+            model_kwargs={"device": "cpu"}
+        )
 
-    # LLM
-    llm = ChatOpenAI(
-        openai_api_key=_api_key,
-        model_name="gpt-3.5-turbo",
-        temperature=0.2
-    )
-
-    # Memory for multi-turn conversation
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer"
-    )
-
-    # RAG chain
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
-        memory=memory,
-        return_source_documents=True,
-    )
-
+    vectorstore = Chroma.from_documents(chunks, embeddings)
     os.unlink(tmp_path)
-    return chain, len(chunks)
+    return vectorstore, len(chunks)
+
+# ── Format docs ───────────────────────────────────────────────
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+# ── Get answer ────────────────────────────────────────────────
+def get_answer(question, vectorstore, chat_history, api_key):
+    llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    api_key=api_key,
+    base_url="https://models.inference.ai.azure.com",
+    temperature=0.2
+)
+
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+    # Format chat history
+    history_text = ""
+    for msg in chat_history[-6:]:
+        if isinstance(msg, HumanMessage):
+            history_text += f"Human: {msg.content}\n"
+        else:
+            history_text += f"Assistant: {msg.content}\n"
+
+    docs    = retriever.invoke(question)
+    context = format_docs(docs)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a helpful assistant that answers questions based on the provided document context.
+Answer only from the context below. If the answer is not in the context, say 'I could not find that in the document.'
+
+Previous conversation:
+{history}
+
+Document context:
+{context}"""),
+        ("human", "{question}")
+    ])
+
+    chain  = prompt | llm | StrOutputParser()
+    answer = chain.invoke({
+        "history":  history_text,
+        "context":  context,
+        "question": question
+    })
+
+    return answer, docs
 
 # ── Handle process button ─────────────────────────────────────
 if process_btn:
-    if not api_key:
-        st.sidebar.error("⚠️ Please enter your OpenAI API key first!")
-    elif not uploaded_file:
-        st.sidebar.error("⚠️ Please upload a PDF file first!")
+    if not uploaded_file:
+        st.sidebar.error("⚠️ Please upload a PDF file!")
     else:
-        with st.spinner("📚 Processing document — chunking, embedding, storing..."):
+        with st.spinner("📚 Processing document..."):
             try:
-                chain, num_chunks = process_document(
+                vectorstore, num_chunks = process_document(
                     uploaded_file.read(),
                     uploaded_file.name,
-                    api_key,
                     chunk_size,
                     chunk_overlap
                 )
-                st.session_state.chain         = chain
+                st.session_state.vectorstore   = vectorstore
                 st.session_state.doc_processed = True
                 st.session_state.doc_name      = uploaded_file.name
                 st.session_state.chat_history  = []
@@ -211,94 +217,72 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("💬 Chat with your document")
 
-    # Display chat history
-    chat_container = st.container()
-    with chat_container:
-        if not st.session_state.chat_history:
-            if st.session_state.doc_processed:
-                st.info(f"📄 **{st.session_state.doc_name}** is ready! Ask me anything about it.")
-            else:
-                st.info("👈 Upload a PDF from the sidebar and click **Process Document** to start chatting.")
+    if not st.session_state.chat_history:
+        if st.session_state.doc_processed:
+            st.info(f"📄 **{st.session_state.doc_name}** is ready! Ask me anything.")
         else:
-            for msg in st.session_state.chat_history:
-                if msg["role"] == "user":
-                    st.markdown(f'<div class="chat-user">🧑 {msg["content"]}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="chat-bot">🤖 {msg["content"]}</div>', unsafe_allow_html=True)
-                    if msg.get("sources"):
-                        with st.expander("📎 Source passages used", expanded=False):
-                            for i, src in enumerate(msg["sources"], 1):
-                                st.markdown(f'<div class="source-box"><b>Source {i} — Page {src["page"]}:</b><br>{src["text"]}</div>', unsafe_allow_html=True)
+            st.info("👈 Upload a PDF from the sidebar and click Process Document to start.")
+    else:
+        for msg in st.session_state.chat_history:
+            if isinstance(msg, HumanMessage):
+                st.markdown(f'<div class="chat-user">🧑 {msg.content}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="chat-bot">🤖 {msg.content}</div>', unsafe_allow_html=True)
 
     st.divider()
 
-    # Input
     with st.form("chat_form", clear_on_submit=True):
         user_input = st.text_input(
-            "Ask a question about your document:",
-            placeholder="e.g. What are the main findings? Summarise chapter 2. What does it say about X?",
+            "Ask a question:",
+            placeholder="e.g. Summarise this document. What does it say about X?",
             disabled=not st.session_state.doc_processed
         )
         submit = st.form_submit_button("Send ➤", use_container_width=True)
 
-    if submit and user_input and st.session_state.chain:
-        st.session_state.chat_history.append({"role": "user", "content": user_input})
+    if submit and user_input and st.session_state.vectorstore:
+        if not api_key:
+            st.error("⚠️ Please enter your Gemini API key in the sidebar!")
+        else:
+            st.session_state.chat_history.append(HumanMessage(content=user_input))
+            with st.spinner("🔍 Searching and generating answer..."):
+                try:
+                    answer, source_docs = get_answer(
+                        user_input,
+                        st.session_state.vectorstore,
+                        st.session_state.chat_history,
+                        api_key
+                    )
+                    st.session_state.chat_history.append(AIMessage(content=answer))
 
-        with st.spinner("🔍 Searching document and generating answer..."):
-            try:
-                result  = st.session_state.chain({"question": user_input})
-                answer  = result["answer"]
-                sources = []
-
-                for doc in result.get("source_documents", []):
-                    sources.append({
-                        "page": doc.metadata.get("page", "?") + 1,
-                        "text": doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
-                    })
-
-                st.session_state.chat_history.append({
-                    "role":    "assistant",
-                    "content": answer,
-                    "sources": sources
-                })
-                st.rerun()
-
-            except Exception as e:
-                st.error(f"❌ Error generating answer: {str(e)}")
+                    if source_docs:
+                        with st.expander("📎 Source passages used", expanded=False):
+                            for i, doc in enumerate(source_docs, 1):
+                                page = doc.metadata.get("page", "?")
+                                st.markdown(f"**Source {i} — Page {page}:**")
+                                st.caption(doc.page_content[:300] + "...")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
 
 with col2:
-    st.subheader("📊 Document Stats")
-
+    st.subheader("📊 Stats")
     if st.session_state.doc_processed:
-        st.metric("Document", st.session_state.doc_name[:25] + "..." if len(st.session_state.doc_name) > 25 else st.session_state.doc_name)
-        st.metric("Messages",  len([m for m in st.session_state.chat_history if m["role"] == "user"]))
+        name = st.session_state.doc_name
+        st.metric("Document", name[:20] + "..." if len(name) > 20 else name)
+        st.metric("Messages", len([m for m in st.session_state.chat_history if isinstance(m, HumanMessage)]))
         st.metric("Status", "✅ Ready")
-
         st.divider()
-        st.markdown("**💡 Example questions:**")
-        example_questions = [
-            "Summarise this document",
-            "What are the key points?",
-            "What does it say about [topic]?",
-            "List the main conclusions",
-            "Explain [specific term]",
-        ]
-        for q in example_questions:
+        st.markdown("**💡 Try asking:**")
+        for q in ["Summarise this document", "What are the key points?", "Explain [topic]", "List the main conclusions"]:
             st.markdown(f"• *{q}*")
     else:
         st.markdown("""
-        **📌 Steps to start:**
-        1. Enter OpenAI API key
+        **📌 Steps:**
+        1. Get free Gemini API key
         2. Upload a PDF
         3. Click Process Document
-        4. Start asking questions!
-        """)
-        st.divider()
-        st.markdown("""
-        **🎯 Good PDFs to try:**
-        - Research papers
-        - Company reports
-        - Study notes
-        - Policy documents
-        - Any textbook chapter
+        4. Start chatting!
+
+        🔗 Get key:
+        aistudio.google.com/app/apikey
         """)
